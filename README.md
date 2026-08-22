@@ -2,22 +2,47 @@
 
 Android signal-only / paper-trading app plus a Python quantitative signal engine.
 
-## Android APK
+## Android APK — v3 scalp mode
 
-The Android app scans **BTC/USDT**, **XRP/USDT**, and **XAU/USDT** (using PAXG/USDT as a gold market-data proxy when exact XAU/USDT is unavailable). It evaluates only **closed 15-minute candles**, confirms the direction with a **1-hour higher timeframe**, and requires at least **70% (14/20) multi-factor consensus** before showing or notifying a signal.
+The Android app scans **BTC/USDT**, **XRP/USDT**, and **XAU/USDT** (using PAXG/USDT as the gold market-data proxy when exact XAU/USDT is unavailable).
 
-The APK never stores exchange API keys and never places orders. It provides entry, ATR/swing stop, 1:2 take profit, 2% paper-risk position sizing, confidence, and a 1R trailing-stop trigger. Android WorkManager performs periodic background scans when networking is available.
+The v3 Android signal flow is staged:
 
-GitHub Actions automatically builds a debug APK after pushes to `main`. Open **Actions → Build Android APK → latest successful run → TradeSignal-APK**.
+1. **1h context + 15m setup** establish direction and reject mixed conditions.
+2. **5m closed-candle confirmation** must then validate the actual entry.
+3. The 5m trigger can be a volume-confirmed breakout, breakout/retest, Bollinger squeeze expansion, or a rule-based AMD sequence: accumulation range → liquidity sweep/manipulation → distribution breakout.
+4. CMF, OBV, RSI, EMA9/20, volume/VMA, ATR, candle body and over-extension checks must support the trigger.
+5. A confirmed trade becomes **ACTIVE** and is locked. Later neutral candles do not erase it.
+6. The active trade remains until **TP, SL, trailing stop, or a 60-minute scalp time exit**.
+7. After an exit, the app waits one 5m candle before another trade and will not reuse the same entry candle.
+
+The scalp target is deliberately smaller than the old v2 swing-style 1:2 target: approximately **1.3R–1.5R**, selected from trigger quality. Trailing protection starts around **+0.8R**. Position size still uses at most **2% of paper equity** as the configured risk budget.
+
+The APK never stores exchange API keys and never places real orders.
+
+### Active trade vs current analysis
+
+The app now displays these separately:
+
+- **ACTIVE TRADE** — locked entry, stop, target, size and trailing state.
+- **CURRENT MARKET ANALYSIS** — latest 15m/1h setup score, 5m trigger score and AMD state.
+
+A new candle can change CURRENT MARKET ANALYSIS without deleting an already-active trade.
+
+### Background behavior
+
+Android WorkManager performs periodic checks roughly every 15 minutes when networking is available. Because 5m scalp confirmations can occur between background runs, the app also supports manual scanning around each 5m candle close. Stale confirmed entries are rejected if live price has moved too far from the confirmed 5m close.
+
+GitHub Actions automatically builds a debug APK after pushes/PRs. Open **Actions → Build Android APK → latest successful run → TradeSignal-APK**.
 
 ## Python signal engine
 
-`backend/signal_engine.py` uses:
+`backend/signal_engine.py` is the separate server/desktop paper-signal engine using:
 
 - `ccxt` for exchange REST market data
-- `pandas` + `pandas-ta` for EMA, RSI, ATR, Bollinger Bands, volume moving average
+- `pandas` + `pandas-ta` for technical indicators
 - `python-telegram-bot` for optional Telegram alerts
-- a persisted paper-trading state file with 2% maximum risk sizing and a trailing stop after +1R
+- persisted paper-trading state
 
 ### Install
 
@@ -31,14 +56,13 @@ pip install -r requirements.txt
 ### Environment variables
 
 ```bash
-export EXCHANGE_ID=binance          # or bybit
+export EXCHANGE_ID=binance
 export PAPER_EQUITY=1000
 export RISK_PCT=0.02
 export CONFIDENCE_THRESHOLD=70
 export MAX_SLIPPAGE_BPS=25
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
-# Optional when your exchange lists another gold symbol:
 export GOLD_SYMBOL=XAU/USDT
 ```
 
@@ -48,10 +72,4 @@ Run:
 python signal_engine.py
 ```
 
-Base `ccxt` uses REST. If you later require exchange WebSockets, add a supported streaming client such as `ccxt.pro`; the signal logic remains the same.
-
-## 20-factor consensus
-
-The score combines 15m EMA direction/price/slope, 1h EMA direction/price/slope, ATR-adjusted RSI conditions, Bollinger position/expansion/breakout, candle range, VMA confirmation, directional candle body, recent swing structure, local breakout context, and an ATR sanity filter.
-
-**Confidence is the percentage of strategy checks agreeing with the direction; it is not a guaranteed win probability.** Measure actual precision, win rate, drawdown, profit factor and out-of-sample performance before relying on any strategy.
+**Confidence is strategy-rule agreement, not a guaranteed win probability.** Judge the strategy from recorded paper results such as win rate, expectancy, drawdown, profit factor, fees/slippage and out-of-sample behavior.
