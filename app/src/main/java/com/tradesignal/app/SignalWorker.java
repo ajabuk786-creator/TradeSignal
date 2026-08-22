@@ -28,7 +28,7 @@ public class SignalWorker extends Worker {
                 TradeStore.Update tradeUpdate = TradeStore.update(ctx,market.id,m5);
                 if (tradeUpdate.closed) notifyText(ctx,market,market.displayName + " scalp closed",tradeUpdate.event);
 
-                if (TradeStore.load(ctx,market.id) != null) continue; // locked trade remains until its exit rule
+                if (TradeStore.load(ctx,market.id) != null) continue;
                 if (TradeStore.inCooldown(ctx,market.id,System.currentTimeMillis())) continue;
 
                 List<SignalEngine.Candle> m15 = MarketDataClient.fetchClosed(market,"15m",180);
@@ -51,10 +51,13 @@ public class SignalWorker extends Worker {
     }
 
     public static void schedule(Context ctx) {
+        WorkManager wm = WorkManager.getInstance(ctx);
+        // v2 used this name. Cancel it once so upgrades do not leave two periodic scanners running.
+        wm.cancelUniqueWork("TradeSignal-15m-background-scan");
         Constraints constraints = new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build();
         PeriodicWorkRequest request = new PeriodicWorkRequest.Builder(SignalWorker.class,15,java.util.concurrent.TimeUnit.MINUTES)
                 .setConstraints(constraints).build();
-        WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(UNIQUE_WORK,ExistingPeriodicWorkPolicy.UPDATE,request);
+        wm.enqueueUniquePeriodicWork(UNIQUE_WORK,ExistingPeriodicWorkPolicy.UPDATE,request);
     }
 
     public static void ensureChannel(Context ctx) {
