@@ -7,8 +7,8 @@ import java.util.*;
 public final class TradeStore {
     private TradeStore() {}
     private static final String PREFS = "trade_signal";
-    private static final long MAX_HOLD_MS = 60L * 60L * 1000L; // 60 minutes
-    private static final long COOLDOWN_MS = 5L * 60L * 1000L;  // one 5m candle
+    private static final long MAX_HOLD_MS = 60L * 60L * 1000L;
+    private static final long COOLDOWN_MS = 5L * 60L * 1000L;
 
     public static final class ActiveTrade {
         public final String marketId, side, setupLabel;
@@ -56,6 +56,13 @@ public final class TradeStore {
         );
     }
 
+    public static boolean canOpen(Context ctx, String marketId, long signalCandleTs) {
+        SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        if (p.getBoolean(key(marketId, "active"), false)) return false;
+        if (System.currentTimeMillis() < p.getLong(key(marketId, "cooldown"), 0L)) return false;
+        return signalCandleTs > p.getLong(key(marketId, "last_entry_candle"), 0L);
+    }
+
     public static void open(Context ctx, String marketId, SignalEngine.Signal s) {
         SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         p.edit()
@@ -70,6 +77,7 @@ public final class TradeStore {
                 .putLong(key(marketId, "trigger"), Double.doubleToRawLongBits(s.trailingTrigger))
                 .putInt(key(marketId, "confidence"), s.confidence)
                 .putLong(key(marketId, "opened"), s.candleCloseTime)
+                .putLong(key(marketId, "last_entry_candle"), s.candleCloseTime)
                 .putBoolean(key(marketId, "trail"), false)
                 .apply();
     }
@@ -96,7 +104,7 @@ public final class TradeStore {
         for (SignalEngine.Candle c : m5) {
             if (c.closeTime <= t.openedAt) continue;
 
-            // Conservative paper handling: if a 5m candle touches both stop and target, count the stop first.
+            // Conservative paper handling: if one 5m candle touches both stop and target, stop is counted first.
             if ("BUY".equals(t.side)) {
                 if (c.low <= sl) return close(ctx, t, sl, "STOP LOSS");
                 if (c.high >= t.takeProfit) return close(ctx, t, t.takeProfit, "TAKE PROFIT");
@@ -104,9 +112,7 @@ public final class TradeStore {
                     trail = true;
                     sl = Math.max(sl, t.entry + 0.05 * t.originalRisk);
                 }
-                if (trail && Double.isFinite(atr) && atr > 0) {
-                    sl = Math.max(sl, c.close - 0.80 * atr);
-                }
+                if (trail && Double.isFinite(atr) && atr > 0) sl = Math.max(sl, c.close - 0.80 * atr);
             } else {
                 if (c.high >= sl) return close(ctx, t, sl, "STOP LOSS");
                 if (c.low <= t.takeProfit) return close(ctx, t, t.takeProfit, "TAKE PROFIT");
@@ -114,9 +120,7 @@ public final class TradeStore {
                     trail = true;
                     sl = Math.min(sl, t.entry - 0.05 * t.originalRisk);
                 }
-                if (trail && Double.isFinite(atr) && atr > 0) {
-                    sl = Math.min(sl, c.close + 0.80 * atr);
-                }
+                if (trail && Double.isFinite(atr) && atr > 0) sl = Math.min(sl, c.close + 0.80 * atr);
             }
         }
 
