@@ -6,84 +6,78 @@ import android.os.Build;
 import androidx.annotation.NonNull;
 import androidx.work.*;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 public class SignalWorker extends Worker {
-    public static final String UNIQUE_WORK = "TradeSignal-scalp-background-scan";
-    public static final String CHANNEL_ID = "trade_signals";
-    private static final double MAX_ENTRY_SLIPPAGE_BPS = 20.0;
+    public static final String UNIQUE_PERIODIC="TradeSignal-v4-periodic";
+    public static final String UNIQUE_NOW="TradeSignal-v4-now";
+    public static final String CHANNEL_ID="trade_signals";
+    private static final long BACKFILL_MS=12L*60L*60L*1000L;
+    private static final long FRESH_NOTIFY_MS=25L*60L*1000L;
 
-    public SignalWorker(@NonNull Context context, @NonNull WorkerParameters params) { super(context, params); }
+    public SignalWorker(@NonNull Context context,@NonNull WorkerParameters params){super(context,params);}
 
-    @NonNull @Override public Result doWork() {
-        Context ctx = getApplicationContext();
-        ensureChannel(ctx);
-        android.content.SharedPreferences prefs = ctx.getSharedPreferences("trade_signal", Context.MODE_PRIVATE);
-        double equity = Double.longBitsToDouble(prefs.getLong("paper_equity_bits", Double.doubleToRawLongBits(1000.0)));
-        int threshold = prefs.getInt("threshold", 70);
-        boolean hadTransientError = false;
+    @NonNull @Override public Result doWork(){
+        Context ctx=getApplicationContext();ensureChannel(ctx);android.content.SharedPreferences prefs=ctx.getSharedPreferences("trade_signal",Context.MODE_PRIVATE);
+        double equity=Double.longBitsToDouble(prefs.getLong("paper_equity_bits",Double.doubleToRawLongBits(1000.0)));int threshold=prefs.getInt("threshold",70);
+        boolean transientError=false;int oldBackfilled=0;
 
-        for (MarketDataClient.Market market : MarketDataClient.MARKETS) {
-            try {
-                List<SignalEngine.Candle> m5 = MarketDataClient.fetchClosed(market,"5m",240);
-                TradeStore.Update tradeUpdate = TradeStore.update(ctx,market.id,m5);
-                if (tradeUpdate.closed) notifyText(ctx,market,market.displayName + " scalp closed",tradeUpdate.event);
+        for(MarketDataClient.Market market:MarketDataClient.MARKETS){
+            try{
+                List<SignalEngine.Candle> m5=MarketDataClient.fetchClosed(market,"5m",360);
+                List<SignalEngine.Candle> m15=MarketDataClient.fetchClosed(market,"15m",240);
+                List<SignalEngine.Candle> h1=MarketDataClient.fetchClosed(market,"1h",160);
 
-                if (TradeStore.load(ctx,market.id) != null) continue;
-                if (TradeStore.inCooldown(ctx,market.id,System.currentTimeMillis())) continue;
+                TradeStore.Update tradeUpdate=TradeStore.update(ctx,market.id,m5);
+                if(tradeUpdate.closed) notifyText(ctx,market,market.displayName+" taken trade closed",tradeUpdate.event);
+                SignalHistoryStore.updateUntakenOutcomes(ctx,market.id,m5);
 
-                List<SignalEngine.Candle> m15 = MarketDataClient.fetchClosed(market,"15m",180);
-                List<SignalEngine.Candle> h1 = MarketDataClient.fetchClosed(market,"1h",120);
-                SignalEngine.Decision decision = SignalEngine.analyzeScalp(m5,m15,h1,equity,threshold);
-                SignalEngine.Signal signal = decision.signal;
-                if (signal == null || !TradeStore.canOpen(ctx,market.id,signal.candleCloseTime)) continue;
-
-                double live = MarketDataClient.fetchLastPrice(market);
-                double slippageBps = Math.abs(live-signal.entry)/Math.max(signal.entry,1e-12)*10000.0;
-                if (slippageBps > MAX_ENTRY_SLIPPAGE_BPS) continue;
-
-                TradeStore.open(ctx,market.id,signal);
-                notifySignal(ctx,market,signal);
-            } catch (Exception e) {
-                hadTransientError = true;
-            }
+                long latestClose=m5.get(m5.size()-1).closeTime;
+                long watermark=prefs.getLong("scan_watermark_"+market.id,Math.max(0,latestClose-BACKFILL_MS));
+                int start=Math.max(120,m5.size()-145);
+                for(int i=start;i<m5.size();i++){
+                    long t=m5.get(i).closeTime;if(t<=watermark)continue;
+                    List<SignalEngine.Candle> five=new ArrayList<>(m5.subList(0,i+1));
+                    List<SignalEngine.Candle> fifteen=through(m15,t);List<SignalEngine.Candle> hour=through(h1,t);
+                    if(fifteen.size()<90||hour.size()<80)continue;
+                    SignalEngine.Decision d=SignalEngine.analyzeScalp(five,fifteen,hour,equity,threshold);
+                    if(d.signal!=null){boolean added=SignalHistoryStore.add(ctx,market,d.signal,System.currentTimeMillis());if(added){long age=System.currentTimeMillis()-d.signal.candleCloseTime;if(age<=FRESH_NOTIFY_MS)notifySignal(ctx,market,d.signal);else oldBackfilled++;}}
+                }
+                prefs.edit().putLong("scan_watermark_"+market.id,latestClose).apply();
+            }catch(Exception e){transientError=true;}
         }
-        return hadTransientError ? Result.retry() : Result.success();
+        prefs.edit().putLong("last_background_scan",System.currentTimeMillis()).apply();
+        if(oldBackfilled>0)notifySummary(ctx,oldBackfilled);
+        return transientError?Result.retry():Result.success();
     }
 
-    public static void schedule(Context ctx) {
-        WorkManager wm = WorkManager.getInstance(ctx);
-        // v2 used this name. Cancel it once so upgrades do not leave two periodic scanners running.
-        wm.cancelUniqueWork("TradeSignal-15m-background-scan");
-        Constraints constraints = new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build();
-        PeriodicWorkRequest request = new PeriodicWorkRequest.Builder(SignalWorker.class,15,java.util.concurrent.TimeUnit.MINUTES)
-                .setConstraints(constraints).build();
-        wm.enqueueUniquePeriodicWork(UNIQUE_WORK,ExistingPeriodicWorkPolicy.UPDATE,request);
+    private static List<SignalEngine.Candle> through(List<SignalEngine.Candle> all,long closeTime){ArrayList<SignalEngine.Candle> out=new ArrayList<>();for(SignalEngine.Candle c:all){if(c.closeTime<=closeTime)out.add(c);else break;}return out;}
+
+    public static void schedule(Context ctx){
+        Constraints c=new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build();
+        PeriodicWorkRequest periodic=new PeriodicWorkRequest.Builder(SignalWorker.class,15,TimeUnit.MINUTES,5,TimeUnit.MINUTES).setConstraints(c).build();
+        WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(UNIQUE_PERIODIC,ExistingPeriodicWorkPolicy.UPDATE,periodic);
+    }
+    public static void enqueueNow(Context ctx){
+        Constraints c=new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build();
+        OneTimeWorkRequest once=new OneTimeWorkRequest.Builder(SignalWorker.class).setConstraints(c).build();
+        WorkManager.getInstance(ctx).enqueueUniqueWork(UNIQUE_NOW,ExistingWorkPolicy.KEEP,once);
     }
 
-    public static void ensureChannel(Context ctx) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationManager nm = ctx.getSystemService(NotificationManager.class);
-            if (nm == null) return;
-            NotificationChannel ch = new NotificationChannel(CHANNEL_ID,"Trade signals",NotificationManager.IMPORTANCE_HIGH);
-            ch.setDescription("Confirmed scalp entries and active trade exits"); nm.createNotificationChannel(ch);
-        }
+    public static void ensureChannel(Context ctx){
+        if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.O){NotificationManager nm=ctx.getSystemService(NotificationManager.class);if(nm==null)return;NotificationChannel ch=new NotificationChannel(CHANNEL_ID,"TradeSignal alerts",NotificationManager.IMPORTANCE_HIGH);ch.setDescription("Confirmed scalp signals saved to History and taken-trade exits");nm.createNotificationChannel(ch);}
     }
 
-    private void notifySignal(Context ctx, MarketDataClient.Market market, SignalEngine.Signal s) {
-        String title = market.displayName + " " + s.side + " scalp · " + s.confidence + "%";
-        String text = String.format(Locale.US,"Entry %.5f | SL %.5f | TP %.5f | R:R 1:%.2f",s.entry,s.stopLoss,s.takeProfit,s.riskReward);
-        notifyText(ctx,market,title,text + "\n" + s.confirmationLabel + "\n" + s.amdState);
+    private void notifySignal(Context ctx,MarketDataClient.Market market,SignalEngine.Signal s){
+        String title=market.displayName+"  "+s.side+" signal · "+s.confidence+"%";
+        String body=String.format(Locale.US,"Entry %.5f | SL %.5f | TP %.5f | %s\nSaved to History. Open app and press TAKE only if you want it.",s.entry,s.stopLoss,s.takeProfit,s.confirmationLabel);
+        notifyText(ctx,market,title,body);
     }
-
-    private void notifyText(Context ctx, MarketDataClient.Market market, String title, String text) {
-        Intent intent = new Intent(ctx,MainActivity.class).putExtra("market",market.id).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent pi = PendingIntent.getActivity(ctx,market.id.hashCode(),intent,PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(ctx,CHANNEL_ID) : new Notification.Builder(ctx);
-        b.setSmallIcon(android.R.drawable.stat_notify_more).setContentTitle(title).setContentText(text)
-                .setStyle(new Notification.BigTextStyle().bigText(text)).setAutoCancel(true).setContentIntent(pi).setPriority(Notification.PRIORITY_HIGH);
-        try {
-            NotificationManager nm = (NotificationManager)ctx.getSystemService(Context.NOTIFICATION_SERVICE);
-            if (nm != null) nm.notify(Math.abs((market.id + title + System.currentTimeMillis()).hashCode()),b.build());
-        } catch (SecurityException ignored) {}
+    private void notifySummary(Context ctx,int n){MarketDataClient.Market m=MarketDataClient.MARKETS[0];notifyText(ctx,m,"TradeSignal history updated",n+" confirmed signal"+(n==1?"":"s")+" were found in missed 5m candle closes and saved to History.");}
+    private void notifyText(Context ctx,MarketDataClient.Market market,String title,String text){
+        Intent intent=new Intent(ctx,MainActivity.class).putExtra("market",market.id).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent pi=PendingIntent.getActivity(ctx,Math.abs((market.id+title).hashCode()),intent,PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder b=Build.VERSION.SDK_INT>=26?new Notification.Builder(ctx,CHANNEL_ID):new Notification.Builder(ctx);b.setSmallIcon(android.R.drawable.stat_notify_more).setContentTitle(title).setContentText(text).setStyle(new Notification.BigTextStyle().bigText(text)).setAutoCancel(true).setContentIntent(pi).setPriority(Notification.PRIORITY_HIGH);
+        try{NotificationManager nm=(NotificationManager)ctx.getSystemService(Context.NOTIFICATION_SERVICE);if(nm!=null)nm.notify(Math.abs((market.id+title+System.currentTimeMillis()).hashCode()),b.build());}catch(SecurityException ignored){}
     }
 }
