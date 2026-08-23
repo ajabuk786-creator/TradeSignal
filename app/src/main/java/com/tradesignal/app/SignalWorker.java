@@ -54,9 +54,12 @@ public class SignalWorker extends Worker {
     private static List<SignalEngine.Candle> through(List<SignalEngine.Candle> all,long closeTime){ArrayList<SignalEngine.Candle> out=new ArrayList<>();for(SignalEngine.Candle c:all){if(c.closeTime<=closeTime)out.add(c);else break;}return out;}
 
     public static void schedule(Context ctx){
+        WorkManager wm=WorkManager.getInstance(ctx);
+        wm.cancelUniqueWork("TradeSignal-scalp-background-scan");
+        wm.cancelUniqueWork("TradeSignal-15m-background-scan");
         Constraints c=new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build();
         PeriodicWorkRequest periodic=new PeriodicWorkRequest.Builder(SignalWorker.class,15,TimeUnit.MINUTES,5,TimeUnit.MINUTES).setConstraints(c).build();
-        WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(UNIQUE_PERIODIC,ExistingPeriodicWorkPolicy.UPDATE,periodic);
+        wm.enqueueUniquePeriodicWork(UNIQUE_PERIODIC,ExistingPeriodicWorkPolicy.UPDATE,periodic);
     }
     public static void enqueueNow(Context ctx){
         Constraints c=new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build();
