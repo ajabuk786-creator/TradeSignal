@@ -7,6 +7,9 @@
         android:label="TradeSignal Pro"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
+        <receiver
+            android:name=".SignalActionReceiver"
+            android:exported="false" />
         <activity
             android:name=".HistoryActivity"
             android:exported="false"
